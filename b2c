@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+
+'''
+Store stdin into an online.net C14 archive
+'''
+
+import argparse
+import time
+import logging
+import re
+import sys
+from ftplib import FTP
+
+import requests
+import yaml
+
+LOGGER = logging.getLogger(__name__)
+
+class C14:
+    '''
+    C14 API helper class
+    '''
+    def __init__(self, args):
+        conf = yaml.load(args.conf, Loader=yaml.BaseLoader)
+        self.__api_session = requests.Session()
+        self.__api_session.headers.update({
+            'Authorization': 'Bearer {}'.format(conf['api_token']),
+            'User-Agent': 'Backup to Cloud'
+        })
+
+        self.__api_url = conf['api_url']
+        LOGGER.debug('API URL: "%s"', self.__api_url)
+
+        self.__safe_id = self.__get_safe_id(conf['safe_name'])
+        LOGGER.debug('SAFE ID: "%s"', self.__safe_id)
+
+        self.__platform_id = conf['platform_id']
+        LOGGER.debug('PLAFORM ID: "%s"', self.__platform_id)
+
+    @staticmethod
+    def __validate(result):
+        result_as_json = result.json()
+        LOGGER.debug('RESULT: %s', result_as_json)
+        if result.ok:
+            return result_as_json
+        raise Exception(result_as_json['error'])
+
+    def __get(self, target, **kwargs):
+        url = '{base}/storage/c14/{target}'.format(base=self.__api_url,
+                                                   target=target)
+        return self.__validate(self.__api_session.get(url, json=kwargs))
+
+    def __post(self, target, **kwargs):
+        url = '{base}/storage/c14/{target}'.format(base=self.__api_url,
+                                                   target=target)
+        return self.__validate(self.__api_session.post(url, json=kwargs))
+
+    def __get_safe_id(self, name):
+        for safe in self.__get('safe'):
+            if safe['name'] == name:
+                return safe['uuid_ref']
+
+        raise Exception('Can\'t find safe "{}"'.format(name))
+
+    def get_archive_jobs(self, archive_id):
+        '''
+        Retrieve the jobs associated with an `archive_id`
+        '''
+        LOGGER.debug('getting jobs from archive "%s"', archive_id)
+        url = 'safe/{}/archive/{}/job'.format(self.__safe_id, archive_id)
+        return self.__get(url)
+
+    def get_archive_incomplete_jobs(self, archive_id):
+        '''
+        Retrieve the jobs associated with an `archive_id` whose status is not done
+        '''
+        LOGGER.debug('getting incomplete jobs from archive "%s"', archive_id)
+        jobs = self.get_archive_jobs(archive_id)
+        return [j for j in jobs if j['status'] != 'done']
+
+    def wait_for_jobs_completion(self, archive_id, timeout_s=300):
+        '''
+        Wait up to `timeout_s` for the completion of the jobs associated with `archive_id`
+        '''
+        LOGGER.debug('waiting for completion of job from archive "%s"', archive_id)
+        start = time.clock_gettime(time.CLOCK_MONOTONIC)
+        while True:
+            jobs = self.get_archive_incomplete_jobs(archive_id)
+            if not jobs:
+                return
+
+            for job in jobs:
+                LOGGER.info('job "%s": progress: %s/100', job['type'], job['progress'])
+
+            time.sleep(10)
+            if time.clock_gettime(time.CLOCK_MONOTONIC) - start > timeout_s:
+                raise Exception('Job completion timed-out')
+
+    def create_archive(self, name, description):
+        '''
+        Create an archive with following `name` and `description`
+        '''
+        LOGGER.debug('creating archive "%s"', name)
+        url = 'safe/{}/archive'.format(self.__safe_id)
+        return self.__post(url, name=name, description=description,
+                           parity='standard', crypto='none',
+                           protocols=['FTP'], days=2,
+                           platforms=[self.__platform_id])
+
+    @staticmethod
+    def __connect_to_ftp(cred):
+        host = re.fullmatch(r'ftp://[^@]+@(?P<name>[^:]+):(?P<port>\d+)',
+                            cred['uri'])
+        LOGGER.debug('FTP host: "%s", port: "%s", login: "%s", password: "%s"',
+                     host['name'], host['port'],
+                     cred['login'], cred['password'])
+
+        ftp = FTP()
+        ftp.connect(host['name'], int(host['port']))
+        ftp.login(cred['login'], cred['password'])
+        return ftp
+
+    def upload_to_archive(self, archive_id, filename, stream):
+        '''
+        Upload the content of the `stream` into the `archive_id` bucket
+        as `filename`
+        '''
+        LOGGER.debug('uploading %s to archive "%s"', filename, archive_id)
+        url = 'safe/{}/archive/{}/bucket'.format(self.__safe_id, archive_id)
+        cred = self.__get(url)['credentials'][0]
+        with self.__connect_to_ftp(cred) as ftp:
+            ftp.storbinary('STOR {}'.format(filename), stream)
+
+    def archive_archive(self, archive_id):
+        '''
+        Finalize the `archive_id`
+        '''
+        LOGGER.debug('archiving archive "%s"', archive_id)
+        url = 'safe/{}/archive/{}/archive'.format(self.__safe_id, archive_id)
+        return self.__post(url)
+
+
+def main():
+    '''
+    Main entry point
+    '''
+    parser = argparse.ArgumentParser(description='Store stdin into a C14 archive')
+    parser.add_argument('--conf', type=argparse.FileType('r'),
+                        required=True,
+                        help='path to the configuration file')
+    parser.add_argument('--name',
+                        help='name of the archive')
+    parser.add_argument('--description',
+                        help='description of the archive')
+    parser.add_argument('--verbose',
+                        action='store_true',
+                        help='enable verbose logging')
+    args = parser.parse_args()
+
+
+    log_format = '%(asctime)-15s %(message)s'
+    if args.verbose:
+        logging.basicConfig(format=log_format, level=logging.DEBUG)
+    else:
+        logging.basicConfig(format=log_format, level=logging.INFO)
+
+    c14 = C14(args)
+
+    LOGGER.info('creating archive...')
+    archive_id = c14.create_archive(args.name, args.description)
+    LOGGER.debug('created archive "%s"', archive_id)
+    LOGGER.info('waiting for remote buffer allocation...')
+    c14.wait_for_jobs_completion(archive_id)
+    LOGGER.info('uploading data to remote buffer...')
+    c14.upload_to_archive(archive_id, 'data', sys.stdin.buffer)
+    LOGGER.info('finalizing archive...')
+    c14.archive_archive(archive_id)
+    LOGGER.info('done.')
+
+
+if __name__ == '__main__':
+    main()
